@@ -330,7 +330,7 @@ class TestRegister(unittest.TestCase):
         self.assertFalse(rt._MODULE_SINGLETON["registered"])
         ctx2 = FakeCtx()
         rt.register(ctx2)  # clean re-register after unload
-        self.assertEqual(len(ctx2.hooks), 2)
+        self.assertEqual(len(ctx2.hooks), 4)
 
 
 class TestNoAnnounceRecursion(unittest.TestCase):
@@ -360,6 +360,58 @@ class TestNoAnnounceRecursion(unittest.TestCase):
             self.assertFalse(rt._looks_like_gateway())
         finally:
             sys.argv = old_argv
+
+
+class TestSessionReset(unittest.TestCase):
+    """10-06 review decision: /new or /reset cancels the pending timer AND its
+    chain record (the awaited context is discarded); context compression must
+    NOT cancel (the conversation survives)."""
+
+    def _armed(self):
+        ctx, plug = make_plugin()
+        ctx.state.set("last_fire", {DM_KEY: {"chain": 2, "minutes": 5, "at": time.time()}})
+        plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=3, announce=False)
+        self.assertIn(DM_KEY, plug._live)
+        return ctx, plug
+
+    def test_new_command_cancels_and_clears_chain(self):
+        ctx, plug = self._armed()
+        plug.on_pre_command(command="new", alias_used="", session_key=DM_KEY)
+        self.assertNotIn(DM_KEY, plug._live)
+        self.assertEqual(ctx.state.get("timers"), {})
+        self.assertNotIn(DM_KEY, ctx.state.get("last_fire") or {})
+
+    def test_reset_alias_cancels(self):
+        ctx, plug = self._armed()
+        plug.on_pre_command(command="", alias_used="reset", session_key=DM_KEY)
+        self.assertNotIn(DM_KEY, plug._live)
+        self.assertNotIn(DM_KEY, ctx.state.get("last_fire") or {})
+
+    def test_other_command_does_not_cancel(self):
+        ctx, plug = self._armed()
+        plug.on_pre_command(command="model", alias_used="", session_key=DM_KEY)
+        self.assertIn(DM_KEY, plug._live)
+        self.assertIn(DM_KEY, ctx.state.get("last_fire") or {})
+
+    def test_compress_reset_does_not_cancel(self):
+        ctx, plug = self._armed()
+        plug.on_session_reset(session_id="s_new", reason="context compression",
+                              old_session_id=DM_SESSION_ID)
+        self.assertIn(DM_KEY, plug._live)
+        self.assertIn(DM_KEY, ctx.state.get("last_fire") or {})
+
+    def test_real_reset_via_old_session_id_cancels(self):
+        ctx, plug = self._armed()
+        plug.on_session_reset(session_id="s_new", reason="user /new",
+                              old_session_id=DM_SESSION_ID)
+        self.assertNotIn(DM_KEY, plug._live)
+        self.assertNotIn(DM_KEY, ctx.state.get("last_fire") or {})
+
+    def test_cancel_without_timer_still_clears_chain(self):
+        ctx, plug = make_plugin()
+        ctx.state.set("last_fire", {DM_KEY: {"chain": 1, "minutes": 3, "at": time.time()}})
+        plug.on_pre_command(command="new", alias_used="", session_key=DM_KEY)
+        self.assertNotIn(DM_KEY, ctx.state.get("last_fire") or {})
 
 
 class TestRealExpiry(unittest.TestCase):

@@ -261,18 +261,59 @@ class ReplyTimeoutPlugin:
             key = self._resolve_session_key(session_id)
             if not key or _dm_chat_id(key) is None:
                 return
-            with self._lock:
-                entry = self._live.pop(key, None)
-                if entry is not None:
-                    entry["timer"].cancel()
-                    self._save_timers()
-                lf = dict(self._ctx.state.get("last_fire") or {})
-                if lf.pop(key, None) is not None:
-                    self._ctx.state.set("last_fire", lf)
-            if entry is not None:
-                logger.info("real inbound cancelled pending timer for %s", key)
+            self._cancel_and_reset_chain(key, "real inbound")
         except Exception:
             logger.exception("pre_llm_call handler error")
+
+    def on_pre_command(
+        self, command: str = "", alias_used: str = "", session_key: str = "", **kwargs: Any
+    ) -> None:
+        """Primary path: /new or /reset (or an alias) is about to run against a
+        session — the awaited context is being discarded by the user, so the
+        pending timer and its chain bookkeeping must go."""
+        try:
+            cmds = {str(command or "").strip().lower(), str(alias_used or "").strip().lower()}
+            if not cmds & {"new", "reset"}:
+                return
+            if not session_key or _dm_chat_id(session_key) is None:
+                return
+            self._cancel_and_reset_chain(session_key, f"session command {sorted(cmds & {'new', 'reset'})}")
+        except Exception:
+            logger.exception("pre_command handler error")
+
+    def on_session_reset(
+        self, session_id: str = "", reason: str = "", old_session_id: str = "", **kwargs: Any
+    ) -> None:
+        """Backstop: a reset happened (e.g. via a surface pre_command cannot
+        see). Context-compression rotations keep the conversation, so those
+        must NOT cancel — only true resets do."""
+        try:
+            why = str(reason or "").lower()
+            if "compress" in why:
+                return
+            key = self._resolve_session_key(old_session_id or session_id)
+            if not key or _dm_chat_id(key) is None:
+                return
+            self._cancel_and_reset_chain(key, f"session reset ({why or 'unspecified'})")
+        except Exception:
+            logger.exception("on_session_reset handler error")
+
+    def _cancel_and_reset_chain(self, session_key: str, why: str) -> bool:
+        """Cancel the pending timer for this session key and clear its chain
+        record, so a later turn does not inherit a stale chain count."""
+        with self._lock:
+            entry = self._live.pop(session_key, None)
+            if entry is not None:
+                entry["timer"].cancel()
+                self._save_timers()
+            lf = dict(self._ctx.state.get("last_fire") or {})
+            removed_chain = lf.pop(session_key, None) is not None
+            if removed_chain:
+                self._ctx.state.set("last_fire", lf)
+        if entry is not None:
+            logger.info("cancelled pending timer for %s (%s)", session_key, why)
+            return True
+        return False
 
     # ------------------------------------------------------------------ worker
 
@@ -505,6 +546,8 @@ def register(ctx: Any) -> None:
     plugin = ReplyTimeoutPlugin(ctx)
     ctx.register_hook("post_llm_call", plugin.on_post_llm_call)
     ctx.register_hook("pre_llm_call", plugin.on_pre_llm_call)
+    ctx.register_hook("pre_command", plugin.on_pre_command)
+    ctx.register_hook("on_session_reset", plugin.on_session_reset)
     ctx.on_unload(plugin.cancel_all)
     if _looks_like_gateway():
         plugin.restore_timers()
