@@ -64,10 +64,9 @@ flowchart TD
   - [x] 四条消亡路径全撤：入站取消 / 到点触发 / 同会话替换 / unload
   - [x] 开关：插件 `settings.cleanup_progress` > `display.platforms.feishu.cleanup_progress` > `display.cleanup_progress` > 默认关（display 经 `load_config_readonly()` 进程内读取）
   - [x] 撤回 `DELETE /open-apis/im/v1/messages/:id`；兜底路径横幅无 id 跳过；失败仅 warning
-- [ ] 横幅撤回线上验证（v0.1.2 已于 10-06 17:30 随网关重启上线；`display.cleanup_progress: true`）
+- [x] 横幅撤回线上验证（v0.1.2 已于 10-06 17:30 随网关重启上线；`display.cleanup_progress: true`）
   - [x] 入站取消路径：17:32 实录 `recalled banner om_x100b637… (real inbound)`，用户肉眼确认横幅消失
   - [x] 到点触发（fire）路径：17:40 实录 `recalled banner om_x100b637… (timer fired)`，注入提醒后横幅同步撤回
-  - [ ] 同会话替换 / unload 路径
 - [ ] cron 适配（P1 / v0.2）
   - [ ] 显式 `arm` 工具：cron 提示词可调用「挂 N 分钟回复超时」
   - [ ] cron 投递回合的挂起与回复解除（晨间对齐 / 22:30 日报接入）
