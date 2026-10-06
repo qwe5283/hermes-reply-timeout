@@ -58,7 +58,13 @@ flowchart TD
   - [x] 10-06 P0 阻断修复：计时器创建后漏 `start()` 致到点不触发；补「真实到点触发」防回归用例（单测 30 项）
   - [x] 10-06 线上验证通过：单横幅 ✓ 挂起 ✓ 真实到点注入 ✓ 入站取消重置 ✓（15:40 实录）
   - [x] 10-06 评审落地：`/new` `/reset` 取消计时器并清链记录（`pre_command` 主路径＋`on_session_reset` 兜底；上下文压缩不取消）（v0.1.1 · 单测 37 项）
-- [ ] 线上验证（链递增与链上限自然到达未实测；reset 取消待网关重启后实测）
+  - [x] 10-06 线上验证：链递增 1→2→3 与 `chain cap reached; not arming` 自然到达（16:31 实录）；`/new` 取消（16:16 实录；`/reset` 与 `/new` 同一命令定义免测）
+- [x] 横幅撤回（v0.1.2 · 2026-10-06 · 单测 52 项）
+  - [x] `_feishu_send_text` 返回 `message_id`，存入 rec 随计时器落盘（重启后仍可撤）
+  - [x] 四条消亡路径全撤：入站取消 / 到点触发 / 同会话替换 / unload
+  - [x] 开关：插件 `settings.cleanup_progress` > `display.platforms.feishu.cleanup_progress` > `display.cleanup_progress` > 默认关（display 经 `load_config_readonly()` 进程内读取）
+  - [x] 撤回 `DELETE /open-apis/im/v1/messages/:id`；兜底路径横幅无 id 跳过；失败仅 warning
+- [ ] 横幅撤回线上验证（待网关重启 + `cleanup_progress` 开启后实测）
 - [ ] cron 适配（P1 / v0.2）
   - [ ] 显式 `arm` 工具：cron 提示词可调用「挂 N 分钟回复超时」
   - [ ] cron 投递回合的挂起与回复解除（晨间对齐 / 22:30 日报接入）
@@ -81,6 +87,7 @@ plugins:
       allow_gateway_injection: true   # 必需：允许注入提醒消息触发网关回合
       settings:
         announce: true                # 是否输出「【回复超时 N min 后触发】」
+        cleanup_progress: true        # 撤回已消亡计时器的横幅；不设则镜像 display 设置
         max_chain: 3                  # 唤醒链上限
         min_minutes: 1                # 钳制下限
         max_minutes: 120              # 钳制上限
@@ -90,6 +97,13 @@ plugins:
 
 > 专用模型覆盖需要同时开 `llm.allow_model_override`（跨 provider 还需
 > `llm.allow_provider_override`），否则回退到会话模型——见官方文档 Plugin LLM Access。
+
+**横幅撤回开关（v0.1.2）**：优先级＝插件 `settings.cleanup_progress`（显式设置时覆盖）
+> `display.platforms.feishu.cleanup_progress` > `display.cleanup_progress` > 默认关。
+> display 读取走核心进程内 `load_config_readonly()`（不解析 yaml 文件）。计时器消亡
+> 四路径（真实入站取消 / 到点触发 / 新计时器替换 / unload）都会撤回横幅；直连 API
+> 发送的横幅带 `message_id` 可撤，`hermes send` 兜底路径发出的无法撤（记 debug 跳过）。
+> 撤回走 `DELETE /open-apis/im/v1/messages/:message_id`，失败仅 warning 不影响主流程。
 
 生效需重启网关（用户手动执行）。
 

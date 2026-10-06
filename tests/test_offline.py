@@ -441,23 +441,163 @@ class TestAnnounce(unittest.TestCase):
     def test_direct_api_preferred_and_subprocess_skipped(self):
         ctx, plug = make_plugin()
         sent = []
-        rt._feishu_send_text = lambda chat_id, text: sent.append((chat_id, text)) or True
-        plug._announce("oc_X", 45)
+        rt._feishu_send_text = lambda chat_id, text: sent.append((chat_id, text)) or "om_1"
+        mid = plug._announce("oc_X", 45)
         self.assertEqual(sent, [("oc_X", "【回复超时 45 min 后触发】")])
+        self.assertEqual(mid, "om_1")
 
     def test_subprocess_fallback_on_api_failure(self):
         ctx, plug = make_plugin()
-        rt._feishu_send_text = lambda chat_id, text: False
+        rt._feishu_send_text = lambda chat_id, text: None
         calls = []
         import subprocess as _sp
 
         orig_run = _sp.run
         _sp.run = lambda *a, **kw: calls.append(a) or orig_run(["true"], capture_output=True, text=True)
         try:
-            plug._announce("oc_X", 45)
+            mid = plug._announce("oc_X", 45)
         finally:
             _sp.run = orig_run
         self.assertEqual(len(calls), 1)
+        self.assertIsNone(mid, "fallback-path banners have no recallable id")
+
+
+def install_fake_hermes_config(cfg):
+    """Point _display_cleanup_flag's `hermes_cli.config` import at a fake."""
+    pkg = types.ModuleType("hermes_cli")
+    mod = types.ModuleType("hermes_cli.config")
+    setattr(mod, "load_config_readonly", lambda: cfg)
+    setattr(pkg, "config", mod)
+    sys.modules["hermes_cli"] = pkg
+    sys.modules["hermes_cli.config"] = mod
+
+
+class TestDisplayCleanupFlag(unittest.TestCase):
+    def tearDown(self):
+        sys.modules.pop("hermes_cli", None)
+        sys.modules.pop("hermes_cli.config", None)
+
+    def test_platform_override_wins(self):
+        install_fake_hermes_config(
+            {"display": {"platforms": {"feishu": {"cleanup_progress": True}},
+                         "cleanup_progress": False}})
+        self.assertIs(rt._display_cleanup_flag(), True)
+
+    def test_global_fallback(self):
+        install_fake_hermes_config({"display": {"cleanup_progress": True}})
+        self.assertIs(rt._display_cleanup_flag(), True)
+
+    def test_platform_false_beats_global_true(self):
+        install_fake_hermes_config(
+            {"display": {"platforms": {"feishu": {"cleanup_progress": False}},
+                         "cleanup_progress": True}})
+        self.assertIs(rt._display_cleanup_flag(), False)
+
+    def test_unset_returns_none(self):
+        install_fake_hermes_config({"display": {}})
+        self.assertIsNone(rt._display_cleanup_flag())
+
+    def test_no_config_module_returns_none(self):
+        # plain `python3 tests/test_offline.py` cannot import hermes_cli at all
+        self.assertIsNone(rt._display_cleanup_flag())
+
+    def test_truthy_coercion(self):
+        self.assertTrue(rt._truthy("true"))
+        self.assertTrue(rt._truthy(1))
+        self.assertFalse(rt._truthy("off"))
+        self.assertFalse(rt._truthy(False))
+        self.assertFalse(rt._truthy(""))
+
+
+class TestBannerRecall(unittest.TestCase):
+    """v0.1.2: every timer-death path recalls its announce banner when the
+    cleanup gate is on; nothing happens when it's off or there's no id."""
+
+    def setUp(self):
+        ctx, plug = make_plugin()
+        self.ctx, self.plug = ctx, plug
+        ctx.config["announce"] = True
+        ctx.config["cleanup_progress"] = True  # plugin-level gate (tests: explicit)
+        self.recalled = []
+        rt._feishu_recall = lambda mid: self.recalled.append(mid) or True
+        rt._feishu_send_text = lambda chat_id, text: "om_banner"
+
+    def test_real_inbound_cancels_and_recalls(self):
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        self.assertEqual(self.plug._live[DM_KEY]["rec"].get("banner_message_id"), "om_banner")
+        self.plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="hi")
+        self.assertEqual(self.recalled, ["om_banner"])
+
+    def test_fire_recalls_banner(self):
+        import threading as _th
+        real_timer = _th.Timer
+
+        class FastTimer(real_timer):
+            def __init__(self, interval, function, args=None, kwargs=None):
+                super().__init__(min(interval, 0.2), function, args=args, kwargs=kwargs)
+
+        rt.threading.Timer = FastTimer
+        try:
+            self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+            deadline = time.time() + 5
+            while time.time() < deadline and not self.ctx.injected:
+                time.sleep(0.05)
+        finally:
+            rt.threading.Timer = real_timer
+        self.assertEqual(len(self.ctx.injected), 1)
+        self.assertEqual(self.recalled, ["om_banner"])
+
+    def test_replacement_recalls_old_banner(self):
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=2, announce=True)
+        self.assertEqual(self.recalled, ["om_banner"])
+
+    def test_cancel_all_recalls(self):
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        self.plug.cancel_all()
+        self.assertEqual(self.recalled, ["om_banner"])
+        self.assertEqual(self.ctx.state.get("timers"), {})
+
+    def test_no_recall_when_cleanup_off(self):
+        self.ctx.config["cleanup_progress"] = False
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        self.plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="hi")
+        self.assertEqual(self.recalled, [])
+
+    def test_no_recall_without_banner_id(self):
+        rt._feishu_send_text = lambda chat_id, text: None  # send failed
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        self.assertNotIn("banner_message_id", self.plug._live[DM_KEY]["rec"])
+        self.plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="hi")
+        self.assertEqual(self.recalled, [])
+
+    def test_banner_id_persisted_for_restore(self):
+        self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+        timers = self.ctx.state.get("timers") or {}
+        self.assertEqual((timers.get(DM_KEY) or {}).get("banner_message_id"), "om_banner")
+
+    def test_plugin_setting_beats_display_flag(self):
+        # plugin says off even though the host display flag would say on
+        self.ctx.config["cleanup_progress"] = False
+        orig = rt._display_cleanup_flag
+        rt._display_cleanup_flag = lambda: True
+        try:
+            self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+            self.plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="hi")
+        finally:
+            rt._display_cleanup_flag = orig
+        self.assertEqual(self.recalled, [])
+
+    def test_display_flag_used_when_plugin_unset(self):
+        self.ctx.config.pop("cleanup_progress", None)
+        orig = rt._display_cleanup_flag
+        rt._display_cleanup_flag = lambda: True
+        try:
+            self.plug._arm(DM_KEY, "oc_TESTCHAT", minutes=30, chain=1, announce=True)
+            self.plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="hi")
+        finally:
+            rt._display_cleanup_flag = orig
+        self.assertEqual(self.recalled, ["om_banner"])
 
 
 class TestTimerStarts(unittest.TestCase):

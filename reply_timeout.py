@@ -125,10 +125,13 @@ def _feishu_tenant_token() -> Optional[str]:
     return token
 
 
-def _feishu_send_text(chat_id: str, text: str) -> bool:
+def _feishu_send_text(chat_id: str, text: str) -> Optional[str]:
+    """Send a text message; return its message_id (None on failure).
+
+    The id is what later banner recall (DELETE im/v1/messages/:id) needs."""
     token = _feishu_tenant_token()
     if not token:
-        return False
+        return None
     try:
         data = _http_post_json(
             f"{_feishu_base()}/open-apis/im/v1/messages?receive_id_type=chat_id",
@@ -138,11 +141,77 @@ def _feishu_send_text(chat_id: str, text: str) -> bool:
         )
     except Exception as exc:
         logger.warning("feishu send failed: %s", exc)
-        return False
+        return None
     if (data or {}).get("code") not in (0, None):
         logger.warning("feishu send rejected: %r", data)
+        return None
+    return ((data or {}).get("data") or {}).get("message_id") or None
+
+
+def _http_delete_json(url: str, headers: dict, timeout: float) -> dict:
+    """Single-shot JSON DELETE (stdlib; monkeypatched in tests). Returns parsed dict."""
+    import json as _json
+    import urllib.request
+
+    req = urllib.request.Request(url, headers=headers, method="DELETE")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+def _feishu_recall(message_id: str) -> bool:
+    """Recall (delete) one message previously sent by this bot. Never raises.
+
+    DELETE /open-apis/im/v1/messages/:message_id — the bot recalling its own
+    DM message; the user must be in the app's availability range (already
+    true since the banner was delivered there)."""
+    if not message_id:
+        return False
+    token = _feishu_tenant_token()
+    if not token:
+        return False
+    try:
+        data = _http_delete_json(
+            f"{_feishu_base()}/open-apis/im/v1/messages/{message_id}",
+            {"Authorization": f"Bearer {token}"}, timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("feishu recall failed for %s: %s", message_id, exc)
+        return False
+    if (data or {}).get("code") not in (0, None):
+        logger.warning("feishu recall rejected for %s: %r", message_id, data)
         return False
     return True
+
+
+def _truthy(value: Any) -> bool:
+    """Tolerant boolean coercion for config values (YAML strings, 0/1, bool)."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(value)
+
+
+def _display_cleanup_flag() -> Optional[bool]:
+    """Read display.platforms.feishu.cleanup_progress (then the global
+    display.cleanup_progress) from the host config via the core's in-process
+    readonly loader — the runtime python has no yaml module, so the raw file
+    is never parsed here. Returns None when unavailable/unset (callers treat
+    that as "not configured", i.e. fall through to the default-off)."""
+    try:
+        from hermes_cli.config import load_config_readonly  # type: ignore
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return None
+    display = cfg.get("display")
+    if not isinstance(display, dict):
+        return None
+    platforms = display.get("platforms")
+    plat = platforms.get("feishu") if isinstance(platforms, dict) else None
+    if isinstance(plat, dict) and plat.get("cleanup_progress") is not None:
+        return _truthy(plat.get("cleanup_progress"))
+    if display.get("cleanup_progress") is not None:
+        return _truthy(display.get("cleanup_progress"))
+    return None
 
 
 def _clip(text: Any, limit: int = _CLIP) -> str:
@@ -190,6 +259,17 @@ class ReplyTimeoutPlugin:
         if isinstance(value, str):
             return value.strip().lower() not in ("false", "0", "no", "off")
         return bool(value)
+
+    def _cleanup_enabled(self) -> bool:
+        """Banner-recall gate: plugin setting ``cleanup_progress`` wins when
+        explicitly set; otherwise mirror the host display setting
+        (``display.platforms.feishu.cleanup_progress`` > global
+        ``display.cleanup_progress``); default off."""
+        value = self._cfg("cleanup_progress", None)
+        if value is not None:
+            return _truthy(value)
+        flag = _display_cleanup_flag()
+        return bool(flag)
 
     # ----------------------------------------------------------------- session
 
@@ -311,6 +391,7 @@ class ReplyTimeoutPlugin:
             if removed_chain:
                 self._ctx.state.set("last_fire", lf)
         if entry is not None:
+            self._recall_banner(entry["rec"], why)
             logger.info("cancelled pending timer for %s (%s)", session_key, why)
             return True
         return False
@@ -389,6 +470,22 @@ class ReplyTimeoutPlugin:
 
     # ----------------------------------------------------------------- arming
 
+    def _recall_banner(self, rec: dict, why: str) -> None:
+        """Recall the announce banner of a dying timer, gated on the cleanup
+        setting. No banner id (announce off / send failed / fallback path) or
+        recall disabled -> silent no-op. Best effort: never raises."""
+        try:
+            if not self._cleanup_enabled():
+                return
+            mid = (rec or {}).get("banner_message_id")
+            if not mid:
+                logger.debug("no banner to recall (%s)", why)
+                return
+            if _feishu_recall(mid):
+                logger.info("recalled banner %s (%s)", mid, why)
+        except Exception:
+            logger.exception("banner recall error (%s)", why)
+
     def _arm(
         self, session_key: str, chat_id: str, minutes: int, chain: int, announce: bool = True
     ) -> None:
@@ -404,14 +501,18 @@ class ReplyTimeoutPlugin:
             old = self._live.pop(session_key, None)
             if old is not None:
                 old["timer"].cancel()
+                self._recall_banner(old["rec"], "replaced by a new timer")
             timer = threading.Timer(minutes * 60, self._fire, args=(session_key, rec))
             timer.daemon = True
             timer.start()  # P0 fix 10-06: Timer was created but never started — armed timers never fired
             self._live[session_key] = {"timer": timer, "rec": rec}
             self._save_timers()
         logger.info("armed %s: %d min (chain %d)", chat_id, minutes, chain)
-        if announce and self._announce_enabled():
-            self._announce(chat_id, minutes)
+        banner_id = announce and self._announce_enabled() and self._announce(chat_id, minutes)
+        if banner_id:
+            with self._lock:
+                rec["banner_message_id"] = banner_id
+                self._save_timers()
 
     def _fire(self, session_key: str, rec: dict) -> None:
         with self._lock:
@@ -443,15 +544,23 @@ class ReplyTimeoutPlugin:
             logger.info(
                 "reminder injected into %s (chain %d)", session_key, rec.get("chain", 1)
             )
+        # The banner said "triggers in N min" — it has now triggered, so it is
+        # stale either way (injected or refused); recall it like any other
+        # dead timer's banner.
+        self._recall_banner(rec, "timer fired")
 
-    def _announce(self, chat_id: str, minutes: int) -> None:
+    def _announce(self, chat_id: str, minutes: int) -> Optional[str]:
+        """Deliver the banner; return its Feishu message_id when the direct
+        API path succeeded (None on the ``hermes send`` fallback or failure —
+        those banners simply cannot be recalled later)."""
         text = ANNOUNCE_TEMPLATE.format(minutes=minutes)
         # Preferred: direct Feishu API (fast, no subprocess). `hermes send`
         # loads the whole plugin system -> slow (observed 20s timeout) and was
         # the recursion vehicle before the gateway-gate fix.
         try:
-            if _feishu_send_text(chat_id, text):
-                return
+            mid = _feishu_send_text(chat_id, text)
+            if mid:
+                return mid
         except Exception:
             logger.exception("direct feishu announce crashed")
         hermes = shutil.which("hermes") or "hermes"
@@ -466,6 +575,7 @@ class ReplyTimeoutPlugin:
                 )
         except Exception as exc:
             logger.warning("announce failed: %s", exc)
+        return None
 
     # ------------------------------------------------------------- persistence
 
@@ -507,6 +617,7 @@ class ReplyTimeoutPlugin:
 
     def cancel_all(self) -> None:
         with self._lock:
+            recs = [entry["rec"] for entry in self._live.values()]
             for entry in self._live.values():
                 entry["timer"].cancel()
             self._live.clear()
@@ -514,6 +625,8 @@ class ReplyTimeoutPlugin:
                 self._ctx.state.set("timers", {})
             except Exception:
                 pass
+        for rec in recs:
+            self._recall_banner(rec, "unload")
         _MODULE_SINGLETON["registered"] = False  # allow a clean re-register after unload
         logger.info("all reply-timeout timers cancelled (unload)")
 
