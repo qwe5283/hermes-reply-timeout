@@ -123,6 +123,8 @@ class TestLifecycle(unittest.TestCase):
         rec = plug._live[DM_KEY]["rec"]
         self.assertEqual(rec["minutes"], 1)
         self.assertEqual(rec["chain"], 1)
+        self.assertTrue(plug._live[DM_KEY]["timer"].is_alive(),
+                        "timer thread must be running after arm")
         self.assertEqual(ctx.state.get("timers"), {DM_KEY: rec})
         # force fire
         plug._live[DM_KEY]["timer"].cancel()
@@ -216,11 +218,17 @@ class TestLifecycle(unittest.TestCase):
         first_timer = plug._live[DM_KEY]["timer"]
         plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
                               user_message="q2", assistant_response="a2")
-        for _ in range(100):
-            if plug._live[DM_KEY]["timer"] is not first_timer:
+        # NOTE: _arm does pop→insert inside the lock; an unlocked reader can
+        # sample the transient empty window, so poll with .get() and only
+        # break on the *new* timer object.
+        for _ in range(200):
+            entry = plug._live.get(DM_KEY)
+            if entry is not None and entry["timer"] is not first_timer:
                 break
             time.sleep(0.02)
-        self.assertIsNot(plug._live[DM_KEY]["timer"], first_timer)
+        entry = plug._live.get(DM_KEY)
+        assert entry is not None, "re-arm must leave a live entry"
+        self.assertIsNot(entry["timer"], first_timer)
 
     def test_intent_zero_not_armed(self):
         ctx, plug = make_plugin(monkey_minutes=0)
@@ -354,6 +362,29 @@ class TestNoAnnounceRecursion(unittest.TestCase):
             sys.argv = old_argv
 
 
+class TestRealExpiry(unittest.TestCase):
+    """One test that lets REAL time pass and requires the timer to actually
+    fire (the 10-06 P0 blocker: Timer was created but never .start()ed, and
+    every other test masked it by calling _fire manually)."""
+
+    def test_timer_fires_and_injects_after_interval(self):
+        ctx, plug = make_plugin()
+        plug._arm(DM_KEY, "oc_TESTCHAT", minutes=0.05, chain=1, announce=False)  # ~3s
+        self.assertTrue(plug._live[DM_KEY]["timer"].is_alive())
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if ctx.injected:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(ctx.injected), 1)
+        content, role, sk = ctx.injected[0]
+        self.assertEqual(content, rt.REMINDER_TEMPLATE.format(minutes=0))
+        self.assertEqual(role, "user")
+        self.assertEqual(sk, DM_KEY)
+        self.assertNotIn(DM_KEY, plug._live)
+        self.assertEqual(ctx.state.get("last_fire")[DM_KEY]["chain"], 1)
+
+
 class TestAnnounce(unittest.TestCase):
     def test_direct_api_preferred_and_subprocess_skipped(self):
         ctx, plug = make_plugin()
@@ -375,6 +406,48 @@ class TestAnnounce(unittest.TestCase):
         finally:
             _sp.run = orig_run
         self.assertEqual(len(calls), 1)
+
+
+class TestTimerStarts(unittest.TestCase):
+    """Regression: armed timers must actually be STARTED (10-06 P0 — Timer was
+    created but .start() was never called, so nothing ever fired on time)."""
+
+    def test_armed_timer_is_alive(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        timer = plug._live[DM_KEY]["timer"]
+        self.assertIsNotNone(timer)
+        self.assertTrue(timer.is_alive(), "armed Timer must be started (alive while waiting)")
+        timer.cancel()
+
+    def test_short_timer_fires_end_to_end(self):
+        import threading as _th
+
+        ctx, plug = make_plugin()
+        real_timer = _th.Timer
+
+        class FastTimer(real_timer):
+            def __init__(self, interval, function, args=None, kwargs=None):
+                super().__init__(min(interval, 0.2), function, args=args, kwargs=kwargs)
+
+        rt.threading.Timer = FastTimer
+        try:
+            plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                                  user_message="q", assistant_response="a")
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctx.injected:
+                time.sleep(0.05)
+        finally:
+            rt.threading.Timer = real_timer
+        self.assertEqual(len(ctx.injected), 1, "timer must fire and inject the reminder")
+        self.assertNotIn(DM_KEY, plug._live)
+        last_fire = ctx.state.get("last_fire") or {}
+        self.assertEqual(last_fire[DM_KEY]["chain"], 1)
 
 
 if __name__ == "__main__":

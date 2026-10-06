@@ -365,6 +365,7 @@ class ReplyTimeoutPlugin:
                 old["timer"].cancel()
             timer = threading.Timer(minutes * 60, self._fire, args=(session_key, rec))
             timer.daemon = True
+            timer.start()  # P0 fix 10-06: Timer was created but never started — armed timers never fired
             self._live[session_key] = {"timer": timer, "rec": rec}
             self._save_timers()
         logger.info("armed %s: %d min (chain %d)", chat_id, minutes, chain)

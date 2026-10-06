@@ -54,6 +54,7 @@ flowchart TD
   - [x] 专用意图模型配置（`intent_provider` / `intent_model`，未授权时回退会话模型）
   - [x] 离线单测 22 项全通过（FakeCtx / FakeLlm）
   - [x] 10-06 实测修复：`hermes send` 子进程级联（register 副作用限网关进程＋restore 永不 announce＋直连飞书 API 发横幅）与同进程双注册守卫（单测 28 项）
+  - [x] 10-06 P0 阻断修复：计时器创建后漏 `start()` 致到点不触发；补「真实到点触发」防回归用例（单测 30 项）
 - [ ] 线上验证（待网关重启后跑一轮真实私聊会话：横幅 → 超时注入 → 链条 → 重置）
 - [ ] cron 适配（P1 / v0.2）
   - [ ] 显式 `arm` 工具：cron 提示词可调用「挂 N 分钟回复超时」
