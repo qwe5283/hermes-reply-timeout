@@ -1,0 +1,5 @@
+name: reply-timeout
+version: "0.1.0"
+description: "Per-chat reply timeout for Feishu DM sessions: after each final reply, a stateless intent call decides how many minutes to wait for the user (0 = don't wait); on expiry a <system_reminder> is injected so the agent can decide what to do. Chain-capped, per-chat independent."
+author: qwe5283
+kind: standalone

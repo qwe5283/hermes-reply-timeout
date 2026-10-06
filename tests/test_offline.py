@@ -1,0 +1,309 @@
+"""Offline unit tests for reply-timeout (no LLM call, no real send, no gateway).
+
+Run: python3 tests/test_offline.py  (from the plugin dir)
+"""
+
+import sys
+import time
+import types
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import reply_timeout as rt  # noqa: E402
+
+
+class FakeState:
+    def __init__(self):
+        self.data = {}
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+class FakeLlmResult:
+    def __init__(self, parsed, text=""):
+        self.parsed = parsed
+        self.text = text
+
+
+class FakeLlm:
+    """Stands in for ctx.llm: returns a fixed minutes value, or raises."""
+
+    def __init__(self, minutes=0, raise_on_override=False, exc=None):
+        self.minutes = minutes
+        self.raise_on_override = raise_on_override
+        self.exc = exc
+        self.calls = []
+
+    def complete_structured(self, provider=None, model=None, **kwargs):
+        self.calls.append({"provider": provider, "model": model})
+        if self.exc:
+            raise self.exc
+        if (provider or model) and self.raise_on_override:
+            raise PermissionError(
+                "Plugin 'reply-timeout' cannot override the model "
+                "(set plugins.entries.reply-timeout.llm.allow_model_override to true to allow)."
+            )
+        return FakeLlmResult(parsed={"minutes": self.minutes})
+
+
+class FakeCtx:
+    def __init__(self):
+        self.config = {"announce": False}  # never actually send in tests
+        self.state = FakeState()
+        self.injected = []
+        self.hooks = []
+        self.unloads = []
+        self.llm = FakeLlm()
+
+    def get_config(self, key, default=None):
+        return self.config.get(key, default)
+
+    def inject_message(self, content, role="user", session_key=None):
+        self.injected.append((content, role, session_key))
+        return True
+
+    def register_hook(self, name, cb):
+        self.hooks.append(name)
+
+    def on_unload(self, cb):
+        self.unloads.append(cb)
+
+
+DM_KEY = "agent:main:feishu:dm:oc_TESTCHAT"
+DM_SESSION_ID = "sess-dm-1"
+
+
+def make_plugin(monkey_minutes=7):
+    ctx = FakeCtx()
+    plug = rt.ReplyTimeoutPlugin(ctx)
+    # deterministic intent via the fake LLM (real _intent_minutes logic runs)
+    ctx.llm = FakeLlm(minutes=monkey_minutes)
+    # point the session-key resolver at our DM key without touching state.db
+    plug._sk_cache[DM_SESSION_ID] = DM_KEY
+    return ctx, plug
+
+
+class TestKeyParsing(unittest.TestCase):
+    def test_dm_key(self):
+        self.assertEqual(rt._dm_chat_id(DM_KEY), "oc_TESTCHAT")
+
+    def test_group_key_rejected(self):
+        self.assertIsNone(rt._dm_chat_id("agent:main:feishu:group:oc_G:ou_U"))
+
+    def test_thread_key_rejected(self):
+        self.assertIsNone(rt._dm_chat_id("agent:main:feishu:dm:oc_D:omt_T"))
+
+    def test_other_platform_rejected(self):
+        self.assertIsNone(rt._dm_chat_id("agent:main:telegram:dm:12345"))
+
+    def test_empty(self):
+        self.assertIsNone(rt._dm_chat_id(None))
+        self.assertIsNone(rt._dm_chat_id(""))
+
+
+class TestLifecycle(unittest.TestCase):
+    def test_arm_and_fire(self):
+        ctx, plug = make_plugin(monkey_minutes=1)
+        plug.on_post_llm_call(
+            session_id=DM_SESSION_ID, platform="feishu",
+            user_message="在吗", assistant_response="在，等你确认",
+        )
+        # worker is async; give it a moment (intent is monkeypatched-instant)
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        self.assertIn(DM_KEY, plug._live)
+        rec = plug._live[DM_KEY]["rec"]
+        self.assertEqual(rec["minutes"], 1)
+        self.assertEqual(rec["chain"], 1)
+        self.assertEqual(ctx.state.get("timers"), {DM_KEY: rec})
+        # force fire
+        plug._live[DM_KEY]["timer"].cancel()
+        plug._fire(DM_KEY, rec)
+        self.assertEqual(len(ctx.injected), 1)
+        content, role, sk = ctx.injected[0]
+        self.assertEqual(content, rt.REMINDER_TEMPLATE.format(minutes=1))
+        self.assertEqual(role, "user")
+        self.assertEqual(sk, DM_KEY)
+        self.assertEqual(ctx.state.get("last_fire")[DM_KEY]["chain"], 1)
+        self.assertEqual(ctx.state.get("timers"), {})
+
+    def test_silent_and_wrong_platform_skip(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="x", assistant_response="[SILENT]")
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="telegram",
+                              user_message="x", assistant_response="hi")
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="x", assistant_response="  ")
+        time.sleep(0.1)
+        self.assertEqual(plug._live, {})
+
+    def test_real_inbound_cancels_and_resets(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        self.assertIn(DM_KEY, plug._live)
+        plug.on_pre_llm_call(session_id=DM_SESSION_ID, user_message="我回来了")
+        self.assertNotIn(DM_KEY, plug._live)
+        self.assertEqual(ctx.state.get("timers"), {})
+
+    def test_reminder_inbound_does_not_cancel(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        plug.on_pre_llm_call(session_id=DM_SESSION_ID,
+                             user_message=rt.REMINDER_TEMPLATE.format(minutes=7))
+        self.assertIn(DM_KEY, plug._live)  # still armed
+
+    def test_cron_mirror_does_not_cancel(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        plug.on_pre_llm_call(session_id=DM_SESSION_ID,
+                             user_message="[Cron delivery: morning-align]\n📌 晨间对齐")
+        self.assertIn(DM_KEY, plug._live)
+
+    def test_chain_cap(self):
+        ctx, plug = make_plugin()
+        reminder_msg = rt.REMINDER_TEMPLATE.format(minutes=5)
+        # simulate three fired reminders already
+        ctx.state.set("last_fire", {DM_KEY: {"chain": 3, "minutes": 5, "at": time.time()}})
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message=reminder_msg, assistant_response="还在等")
+        time.sleep(0.1)
+        self.assertEqual(plug._live, {})  # chain 4 > max_chain 3 -> not armed
+
+    def test_chain_increments_on_reminder_turn(self):
+        ctx, plug = make_plugin()
+        reminder_msg = rt.REMINDER_TEMPLATE.format(minutes=5)
+        ctx.state.set("last_fire", {DM_KEY: {"chain": 2, "minutes": 5, "at": time.time()}})
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message=reminder_msg, assistant_response="再等等")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        self.assertEqual(plug._live[DM_KEY]["rec"]["chain"], 3)
+
+    def test_rearm_replaces(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q1", assistant_response="a1")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        first_timer = plug._live[DM_KEY]["timer"]
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q2", assistant_response="a2")
+        for _ in range(100):
+            if plug._live[DM_KEY]["timer"] is not first_timer:
+                break
+            time.sleep(0.02)
+        self.assertIsNot(plug._live[DM_KEY]["timer"], first_timer)
+
+    def test_intent_zero_not_armed(self):
+        ctx, plug = make_plugin(monkey_minutes=0)
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="好的", assistant_response="不客气")
+        time.sleep(0.1)
+        self.assertEqual(plug._live, {})
+
+    def test_clamp_via_real_intent(self):
+        ctx, plug = make_plugin()
+        ctx.llm = FakeLlm(minutes=999)
+        minutes = plug._intent_minutes("q", "a")
+        self.assertEqual(minutes, 120)
+
+    def test_intent_zero_via_real_intent(self):
+        ctx, plug = make_plugin()
+        ctx.llm = FakeLlm(minutes=0)
+        self.assertEqual(plug._intent_minutes("好的", "不客气"), 0)
+
+
+class TestIntentFallback(unittest.TestCase):
+    def test_override_denied_falls_back_to_session_model(self):
+        ctx, plug = make_plugin()
+        ctx.config["intent_model"] = "some-cheap-model"
+        ctx.llm = FakeLlm(minutes=10, raise_on_override=True)
+        minutes = plug._intent_minutes("q", "a")
+        self.assertEqual(minutes, 10)
+        self.assertEqual(len(ctx.llm.calls), 2)  # denied, then fallback
+        self.assertIsNone(ctx.llm.calls[1]["model"])  # session model on retry
+
+    def test_llm_failure_returns_zero(self):
+        ctx, plug = make_plugin()
+        ctx.llm = FakeLlm(exc=RuntimeError("provider down"))
+        self.assertEqual(plug._intent_minutes("q", "a"), 0)
+
+    def test_unparsable_output_returns_zero(self):
+        ctx, plug = make_plugin()
+        ctx.llm = FakeLlm(minutes=7)
+        ctx.llm.complete_structured = lambda **kw: FakeLlmResult(parsed=None, text="huh")
+        self.assertEqual(plug._intent_minutes("q", "a"), 0)
+
+
+class TestRestore(unittest.TestCase):
+    def test_restore_unexpired_and_drop_expired(self):
+        ctx, plug = make_plugin()
+        now = time.time()
+        ctx.state.set("timers", {
+            DM_KEY: {"session_key": DM_KEY, "chat_id": "oc_TESTCHAT", "minutes": 30,
+                     "chain": 2, "armed_at": now - 60, "expires_at": now + 1500},
+            "agent:main:feishu:dm:oc_OLD": {"session_key": "agent:main:feishu:dm:oc_OLD",
+                     "chat_id": "oc_OLD", "minutes": 5, "chain": 1,
+                     "armed_at": now - 999, "expires_at": now - 60},
+        })
+        plug.restore_timers()
+        self.assertIn(DM_KEY, plug._live)
+        rec = plug._live[DM_KEY]["rec"]
+        self.assertEqual(rec["chain"], 2)
+        self.assertTrue(1 <= rec["minutes"] <= 25, rec["minutes"])  # ~25 min left
+        timers = ctx.state.get("timers")
+        self.assertIn(DM_KEY, timers)
+        self.assertNotIn("agent:main:feishu:dm:oc_OLD", timers)
+
+    def test_cancel_all(self):
+        ctx, plug = make_plugin()
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        plug.cancel_all()
+        self.assertEqual(plug._live, {})
+        self.assertEqual(ctx.state.get("timers"), {})
+
+
+class TestRegister(unittest.TestCase):
+    def test_register_wires_hooks(self):
+        ctx = FakeCtx()
+        rt.register(ctx)
+        self.assertIn("post_llm_call", ctx.hooks)
+        self.assertIn("pre_llm_call", ctx.hooks)
+        self.assertEqual(len(ctx.unloads), 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
