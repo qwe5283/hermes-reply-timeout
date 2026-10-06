@@ -25,6 +25,46 @@ Hermes 的交互提问（clarify）只能活在一轮对话内；cron 是定时�
 
 群聊（`group_sessions_per_user`、话题）与 cron 投递适配为第二版范围。
 
+## 行为流程图
+
+```mermaid
+flowchart TD
+    A["最终回复落地<br/>（post_llm_call · 仅飞书私聊会话）"] --> B["后台线程发起无状态意图调用<br/>ctx.llm.complete_structured<br/>（不进上下文、不写对话史）"]
+    B --> C{"minutes = 0？<br/>（0＝不等待，非零钳制 1–120）"}
+    C -- "0" --> X1["不挂起，本轮结束"]
+    C -- "N &gt; 0" --> D["挂 per-chat 定时器（落盘可恢复）<br/>输出「【回复超时 N min 后触发】」<br/>（announce 开关，默认开）"]
+    D --> E{"超时窗口内发生什么？"}
+    E -- "真实用户消息<br/>（pre_llm_call）" --> F["取消定时器<br/>重置链计数 → 回到正常对话"]
+    E -- "系统消息<br/>（system_reminder 自注入 / Cron 投递镜像）" --> G["识别并忽略<br/>不影响计时"]
+    E -- "到时未回" --> H["注入提醒消息<br/>「用户在 N min 后未做回复」<br/>（user 角色 · 进上下文 · 触发完整 agent 回合）"]
+    H --> I{"链长 &lt; max_chain？<br/>（默认 3）"}
+    I -- "是" --> B
+    I -- "否" --> X2["达链上限，不再挂起<br/>（等待真实用户消息重置）"]
+```
+
+## 任务清单
+
+- [x] P0 实现（v0.1.0 · 2026-10-06）
+  - [x] `post_llm_call` 挂起 + 无状态意图调用（`ctx.llm.complete_structured`）
+  - [x] per-chat 定时器 + 横幅输出（`announce` 开关）
+  - [x] 超时注入 `system_reminder`（`allow_gateway_injection: true`）
+  - [x] 真实入站取消并重置链；系统消息过滤（reminder / Cron 镜像不误触发）
+  - [x] 链上限（`max_chain`，默认 3）
+  - [x] 网关重启恢复（未到期按剩余时间重挂、已到期丢弃）
+  - [x] 专用意图模型配置（`intent_provider` / `intent_model`，未授权时回退会话模型）
+  - [x] 离线单测 22 项全通过（FakeCtx / FakeLlm）
+- [ ] 线上验证（待网关重启后跑一轮真实私聊会话：横幅 → 超时注入 → 链条 → 重置）
+- [ ] cron 适配（P1 / v0.2）
+  - [ ] 显式 `arm` 工具：cron 提示词可调用「挂 N 分钟回复超时」
+  - [ ] cron 投递回合的挂起与回复解除（晨间对齐 / 22:30 日报接入）
+- [ ] 群聊适配（P2 / v0.3）
+  - [ ] `group_sessions_per_user` 两种隔离模式的键位适配
+  - [ ] 话题群（thread）会话键支持与投递落点验证
+  - [ ] feishu-history 插件兼容性验证
+- [ ] 礼貌守卫（非功能性 / P3）
+  - [ ] 静默时段（active hours，窗外不挂或顺延）
+  - [ ] 次数/频率上限（每日唤醒配额）
+
 ## 配置（`~/.hermes/config.yaml`）
 
 ```yaml
