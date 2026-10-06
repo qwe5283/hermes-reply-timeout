@@ -501,12 +501,15 @@ class ReplyTimeoutPlugin:
             old = self._live.pop(session_key, None)
             if old is not None:
                 old["timer"].cancel()
-                self._recall_banner(old["rec"], "replaced by a new timer")
             timer = threading.Timer(minutes * 60, self._fire, args=(session_key, rec))
             timer.daemon = True
             timer.start()  # P0 fix 10-06: Timer was created but never started — armed timers never fired
             self._live[session_key] = {"timer": timer, "rec": rec}
             self._save_timers()
+        if old is not None:
+            # outside the lock: recall is network I/O (up to 10s) and must not
+            # block concurrent hook callbacks waiting on the plugin lock
+            self._recall_banner(old["rec"], "replaced by a new timer")
         logger.info("armed %s: %d min (chain %d)", chat_id, minutes, chain)
         banner_id = announce and self._announce_enabled() and self._announce(chat_id, minutes)
         if banner_id:
