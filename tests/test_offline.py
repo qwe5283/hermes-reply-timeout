@@ -298,11 +298,83 @@ class TestRestore(unittest.TestCase):
 
 class TestRegister(unittest.TestCase):
     def test_register_wires_hooks(self):
+        rt._MODULE_SINGLETON["registered"] = False
         ctx = FakeCtx()
         rt.register(ctx)
         self.assertIn("post_llm_call", ctx.hooks)
         self.assertIn("pre_llm_call", ctx.hooks)
         self.assertEqual(len(ctx.unloads), 1)
+
+    def test_second_register_is_a_noop(self):
+        rt._MODULE_SINGLETON["registered"] = False
+        ctx = FakeCtx()
+        rt.register(ctx)
+        n_hooks, n_unloads = len(ctx.hooks), len(ctx.unloads)
+        rt.register(ctx)  # duplicate load, no intervening unload
+        self.assertEqual(len(ctx.hooks), n_hooks)
+        self.assertEqual(len(ctx.unloads), n_unloads)
+
+    def test_unload_resets_singleton(self):
+        rt._MODULE_SINGLETON["registered"] = False
+        ctx = FakeCtx()
+        rt.register(ctx)
+        ctx.unloads[0]()  # cancel_all
+        self.assertFalse(rt._MODULE_SINGLETON["registered"])
+        ctx2 = FakeCtx()
+        rt.register(ctx2)  # clean re-register after unload
+        self.assertEqual(len(ctx2.hooks), 2)
+
+
+class TestNoAnnounceRecursion(unittest.TestCase):
+    def test_restore_does_not_announce(self):
+        ctx, plug = make_plugin()
+        ctx.config["announce"] = True
+        sent = []
+        plug._announce = lambda chat_id, minutes: sent.append((chat_id, minutes))
+        plug.on_post_llm_call(session_id=DM_SESSION_ID, platform="feishu",
+                              user_message="q", assistant_response="a")
+        for _ in range(100):
+            if plug._live:
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(sent), 1)  # the initial arm announced once
+        plug.restore_timers()  # restart path: re-arm silently
+        self.assertEqual(len(sent), 1)  # ...and did NOT announce again
+
+    def test_gateway_detection(self):
+        old_argv = sys.argv
+        try:
+            sys.argv = ["hermes", "gateway", "run"]
+            self.assertTrue(rt._looks_like_gateway())
+            sys.argv = ["hermes", "send", "--to", "feishu:oc_X", "msg"]
+            self.assertFalse(rt._looks_like_gateway())
+            sys.argv = ["hermes", "chat", "-q", "hi"]
+            self.assertFalse(rt._looks_like_gateway())
+        finally:
+            sys.argv = old_argv
+
+
+class TestAnnounce(unittest.TestCase):
+    def test_direct_api_preferred_and_subprocess_skipped(self):
+        ctx, plug = make_plugin()
+        sent = []
+        rt._feishu_send_text = lambda chat_id, text: sent.append((chat_id, text)) or True
+        plug._announce("oc_X", 45)
+        self.assertEqual(sent, [("oc_X", "【回复超时 45 min 后触发】")])
+
+    def test_subprocess_fallback_on_api_failure(self):
+        ctx, plug = make_plugin()
+        rt._feishu_send_text = lambda chat_id, text: False
+        calls = []
+        import subprocess as _sp
+
+        orig_run = _sp.run
+        _sp.run = lambda *a, **kw: calls.append(a) or orig_run(["true"], capture_output=True, text=True)
+        try:
+            plug._announce("oc_X", 45)
+        finally:
+            _sp.run = orig_run
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

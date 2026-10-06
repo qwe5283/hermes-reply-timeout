@@ -32,6 +32,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -61,6 +62,87 @@ INTENT_INSTRUCTIONS = (
 )
 
 _CLIP = 1200  # chars per field in the intent payload
+
+_FEISHU_DOMAIN_MAP = {"feishu": "https://open.feishu.cn", "lark": "https://open.larksuite.com"}
+_TOKEN_CACHE: dict = {"token": None, "expires_at": 0.0}
+
+
+def _read_secret(name: str) -> Optional[str]:
+    """Env var first, then the profile home's ``.env`` (feishu-history's recipe)."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    try:
+        for line in (Path(home) / ".env").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
+def _feishu_base() -> str:
+    domain = (_read_secret("FEISHU_DOMAIN") or "feishu").strip().lower()
+    return _FEISHU_DOMAIN_MAP.get(domain, f"https://{domain}")
+
+
+def _http_post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
+    """Single-shot JSON POST (stdlib; monkeypatched in tests). Returns parsed dict."""
+    import json as _json
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, data=_json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+def _feishu_tenant_token() -> Optional[str]:
+    now = time.time()
+    if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"]:
+        return _TOKEN_CACHE["token"]
+    app_id, app_secret = _read_secret("FEISHU_APP_ID"), _read_secret("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        return None
+    try:
+        data = _http_post_json(
+            f"{_feishu_base()}/open-apis/auth/v3/tenant_access_token/internal",
+            {"app_id": app_id, "app_secret": app_secret}, {}, timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("feishu token fetch failed: %s", exc)
+        return None
+    token = (data or {}).get("tenant_access_token")
+    if not token:
+        logger.warning("feishu token fetch bad response: %r", data)
+        return None
+    # ~2h validity; keep a margin (feishu-history's rule)
+    _TOKEN_CACHE.update(token=token, expires_at=now + 90 * 60)
+    return token
+
+
+def _feishu_send_text(chat_id: str, text: str) -> bool:
+    token = _feishu_tenant_token()
+    if not token:
+        return False
+    try:
+        data = _http_post_json(
+            f"{_feishu_base()}/open-apis/im/v1/messages?receive_id_type=chat_id",
+            {"receive_id": chat_id, "msg_type": "text",
+             "content": __import__("json").dumps({"text": text})},
+            {"Authorization": f"Bearer {token}"}, timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("feishu send failed: %s", exc)
+        return False
+    if (data or {}).get("code") not in (0, None):
+        logger.warning("feishu send rejected: %r", data)
+        return False
+    return True
 
 
 def _clip(text: Any, limit: int = _CLIP) -> str:
@@ -266,7 +348,9 @@ class ReplyTimeoutPlugin:
 
     # ----------------------------------------------------------------- arming
 
-    def _arm(self, session_key: str, chat_id: str, minutes: int, chain: int) -> None:
+    def _arm(
+        self, session_key: str, chat_id: str, minutes: int, chain: int, announce: bool = True
+    ) -> None:
         rec = {
             "session_key": session_key,
             "chat_id": chat_id,
@@ -284,7 +368,7 @@ class ReplyTimeoutPlugin:
             self._live[session_key] = {"timer": timer, "rec": rec}
             self._save_timers()
         logger.info("armed %s: %d min (chain %d)", chat_id, minutes, chain)
-        if self._announce_enabled():
+        if announce and self._announce_enabled():
             self._announce(chat_id, minutes)
 
     def _fire(self, session_key: str, rec: dict) -> None:
@@ -319,16 +403,20 @@ class ReplyTimeoutPlugin:
             )
 
     def _announce(self, chat_id: str, minutes: int) -> None:
+        text = ANNOUNCE_TEMPLATE.format(minutes=minutes)
+        # Preferred: direct Feishu API (fast, no subprocess). `hermes send`
+        # loads the whole plugin system -> slow (observed 20s timeout) and was
+        # the recursion vehicle before the gateway-gate fix.
+        try:
+            if _feishu_send_text(chat_id, text):
+                return
+        except Exception:
+            logger.exception("direct feishu announce crashed")
         hermes = shutil.which("hermes") or "hermes"
         try:
             proc = subprocess.run(
-                [
-                    hermes, "send", "--to", f"feishu:{chat_id}", "--quiet",
-                    ANNOUNCE_TEMPLATE.format(minutes=minutes),
-                ],
-                timeout=20,
-                capture_output=True,
-                text=True,
+                [hermes, "send", "--to", f"feishu:{chat_id}", "--quiet", text],
+                timeout=20, capture_output=True, text=True,
             )
             if proc.returncode != 0:
                 logger.warning(
@@ -349,7 +437,9 @@ class ReplyTimeoutPlugin:
 
     def restore_timers(self) -> None:
         """After a restart: re-arm unexpired timers with remaining time, drop
-        expired ones. Called once from register()."""
+        expired ones. Called once from register() — gateway processes only.
+        NEVER announces: an announce here would spawn ``hermes send``, which
+        itself loads plugins and would recurse (observed 2026-10-06)."""
         try:
             with self._lock:
                 stored = dict(self._ctx.state.get("timers") or {})
@@ -367,7 +457,7 @@ class ReplyTimeoutPlugin:
                 self._live.clear()
                 self._ctx.state.set("timers", {})
             for sk, chat, minutes, chain in valid:
-                self._arm(sk, chat, minutes, chain)
+                self._arm(sk, chat, minutes, chain, announce=False)
             if valid:
                 logger.info("restored %d timer(s) after restart", len(valid))
         except Exception:
@@ -382,13 +472,44 @@ class ReplyTimeoutPlugin:
                 self._ctx.state.set("timers", {})
             except Exception:
                 pass
+        _MODULE_SINGLETON["registered"] = False  # allow a clean re-register after unload
         logger.info("all reply-timeout timers cancelled (unload)")
 
 
+def _looks_like_gateway() -> bool:
+    """Best-effort: is this process the long-lived gateway?
+
+    ``hermes send`` (and other one-shot CLI invocations) also load the plugin
+    system, so register()-time side effects must not run there — restoring
+    timers inside ``hermes send`` re-armed the timer and re-announced, spawning
+    another ``hermes send`` (infinite recursion, observed 2026-10-06).
+    """
+    argv = [str(a) for a in sys.argv[:4]]
+    return any("gateway" in a for a in argv)
+
+
+_MODULE_SINGLETON = {"registered": False}
+
+
 def register(ctx: Any) -> None:
+    if _MODULE_SINGLETON["registered"]:
+        # Same process loaded us twice (no intervening unload) — a second
+        # instance would double-fire every hook: two intent calls, two timers,
+        # two reminders. Keep exactly one live instance.
+        logger.warning(
+            "reply-timeout: register() called again without unload; keeping the existing instance"
+        )
+        return
+    _MODULE_SINGLETON["registered"] = True
     plugin = ReplyTimeoutPlugin(ctx)
     ctx.register_hook("post_llm_call", plugin.on_post_llm_call)
     ctx.register_hook("pre_llm_call", plugin.on_pre_llm_call)
     ctx.on_unload(plugin.cancel_all)
-    plugin.restore_timers()
-    logger.info("reply-timeout registered (P0: Feishu DM sessions)")
+    if _looks_like_gateway():
+        plugin.restore_timers()
+        logger.info("reply-timeout registered (P0: Feishu DM sessions, gateway)")
+    else:
+        logger.info(
+            "reply-timeout registered (P0: Feishu DM sessions, non-gateway argv=%s; timers not restored)",
+            sys.argv[:3],
+        )

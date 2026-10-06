@@ -53,6 +53,7 @@ flowchart TD
   - [x] 网关重启恢复（未到期按剩余时间重挂、已到期丢弃）
   - [x] 专用意图模型配置（`intent_provider` / `intent_model`，未授权时回退会话模型）
   - [x] 离线单测 22 项全通过（FakeCtx / FakeLlm）
+  - [x] 10-06 实测修复：`hermes send` 子进程级联（register 副作用限网关进程＋restore 永不 announce＋直连飞书 API 发横幅）与同进程双注册守卫（单测 28 项）
 - [ ] 线上验证（待网关重启后跑一轮真实私聊会话：横幅 → 超时注入 → 链条 → 重置）
 - [ ] cron 适配（P1 / v0.2）
   - [ ] 显式 `arm` 工具：cron 提示词可调用「挂 N 分钟回复超时」
